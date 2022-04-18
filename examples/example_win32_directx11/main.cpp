@@ -69,8 +69,10 @@ int main(int, char**)
     //io.Fonts->AddFontFromFileTTF("../../misc/fonts/Cousine-Regular.ttf", 15.0f);
     //io.Fonts->AddFontFromFileTTF("../../misc/fonts/DroidSans.ttf", 16.0f);
     //io.Fonts->AddFontFromFileTTF("../../misc/fonts/ProggyTiny.ttf", 10.0f);
-    //ImFont* font = io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\ArialUni.ttf", 18.0f, NULL, io.Fonts->GetGlyphRangesJapanese());
+    ImFont* font = io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\SourceHanSansK-Normal.otf", 18.0f, NULL, io.Fonts->GetGlyphRangesKorean());
     //IM_ASSERT(font != NULL);
+    io.Fonts->TexDesiredWidth = 1024;
+    io.Fonts->TexDesiredHeight = 1024;
 
     // Our state
     bool show_demo_window = true;
