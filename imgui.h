@@ -76,6 +76,7 @@ Index of this file:
 
 // Includes
 #include <float.h>                  // FLT_MIN, FLT_MAX
+#include <math.h>
 #include <stdarg.h>                 // va_list, va_start, va_end
 #include <stddef.h>                 // ptrdiff_t, NULL
 #include <string.h>                 // memset, memmove, memcpy, strlen, strchr, strcpy, strcmp
@@ -1731,6 +1732,7 @@ enum ImGuiConfigFlags_
     ImGuiConfigFlags_NoMouse                = 1 << 4,   // Instruct dear imgui to disable mouse inputs and interactions.
     ImGuiConfigFlags_NoMouseCursorChange    = 1 << 5,   // Instruct backend to not alter mouse cursor shape and visibility. Use if the backend cursor changes are interfering with yours and you don't want to use SetMouseCursor() to change mouse cursor. You may want to honor requests from imgui by reading GetMouseCursor() yourself instead.
     ImGuiConfigFlags_NoKeyboard             = 1 << 6,   // Instruct dear imgui to disable keyboard inputs and interactions. This is done by ignoring keyboard events and clearing existing states.
+    ImGuiConfigFlags_NoKerning              = 1 << 8,   // Instruct imgui to ignore kerning when drawing all text.
 
     // [BETA] Docking
     ImGuiConfigFlags_DockingEnable          = 1 << 7,   // Docking enable flags.
@@ -3629,6 +3631,7 @@ struct ImFontGlyph
     float           X0, Y0, X1, Y1;     // Glyph corners. Offsets from current cursor/layout position.
     float           U0, V0, U1, V1;     // Texture coordinates for the current value of ImFontAtlas->TexRef. Cached equivalent of calling GetCustomRect() with PackId.
     int             PackId;             // [Internal] ImFontAtlasRectId value (FIXME: Cold data, could be moved elsewhere?)
+    unsigned int    KerningPairOffset;
 
     ImFontGlyph()   { memset(this, 0, sizeof(*this)); PackId = -1; }
 };
@@ -3840,12 +3843,42 @@ struct ImFontAtlas
     //typedef ImFontGlyphRangesBuilder  GlyphRangesBuilder;      // OBSOLETED in 1.67+
 };
 
+struct ImFontKerningPair
+{
+    ImWchar Left;              // Glyph that comes to the left of the kerning pair.
+    ImWchar Right;             // Glyph that comes to the right of the kerning pair.
+    float Distance;            // Adjustment to advance width in pixel unit.
+
+    ImFontKerningPair() : Left(), Right(), Distance() {}
+    ImFontKerningPair(ImWchar left, ImWchar right, float distance) : Left(left), Right(right), Distance(distance) {}
+
+    static int PairComparator(const void* l, const void* r) {
+        const auto& lp = *static_cast<const ImFontKerningPair*>(l);
+        const auto& rp = *static_cast<const ImFontKerningPair*>(r);
+        return lp.Right == rp.Right ? (int)lp.Left - (int)rp.Left : (int)lp.Right - (int)rp.Right;
+    }
+};
+
+struct ImFontIndexData {
+    float AdvanceX;
+    float Width;
+    int KerningPairOffset;
+
+    constexpr IMGUI_API ImFontIndexData() : ImFontIndexData(NAN) {}
+    constexpr IMGUI_API ImFontIndexData(float advanceX) : ImFontIndexData(advanceX, advanceX) {}
+    constexpr IMGUI_API ImFontIndexData(float advanceX, float width) : ImFontIndexData(advanceX, width, -1) {}
+    constexpr IMGUI_API ImFontIndexData(float advanceX, float width, int kerningPairOffset) : AdvanceX(advanceX), Width(width), KerningPairOffset(kerningPairOffset) {}
+    constexpr bool IMGUI_API IsValid() const { return AdvanceX == AdvanceX; /* NaN check */ }
+    constexpr ImFontIndexData operator*(float r) const { return {AdvanceX * r, Width * r}; }
+    constexpr ImFontIndexData& operator*=(float r) { AdvanceX *= r; Width *= r; return *this; }
+};
+
 // Font runtime data for a given size
 // Important: pointers to ImFontBaked are only valid for the current frame.
 struct ImFontBaked
 {
     // [Internal] Members: Hot ~20/24 bytes (for CalcTextSize)
-    ImVector<float>             IndexAdvanceX;      // 12-16 // out // Sparse. Glyphs->AdvanceX in a directly indexable way (cache-friendly for CalcTextSize functions which only this info, and are often bottleneck in large UI).
+    ImVector<ImFontIndexData>   IndexData;          // 12-16 // out // Sparse. Glyphs->AdvanceX in a directly indexable way (cache-friendly for CalcTextSize functions which only this info, and are often bottleneck in large UI).
     float                       FallbackAdvanceX;   // 4     // out // FindGlyph(FallbackChar)->AdvanceX
     float                       Size;               // 4     // in  // Height of characters/line, set during loading (doesn't change after loading)
     float                       RasterizerDensity;  // 4     // in  // Density this is baked at
@@ -3870,8 +3903,9 @@ struct ImFontBaked
     IMGUI_API void              ClearOutputData();
     IMGUI_API ImFontGlyph*      FindGlyph(ImWchar c);               // Return U+FFFD glyph if requested glyph doesn't exists.
     IMGUI_API ImFontGlyph*      FindGlyphNoFallback(ImWchar c);     // Return NULL if glyph doesn't exist
-    IMGUI_API float             GetCharAdvance(ImWchar c);
+    IMGUI_API ImFontIndexData   GetCharAdvance(ImWchar c);
     IMGUI_API bool              IsGlyphLoaded(ImWchar c);
+    IMGUI_API float             GetKerningPairAdjustment(ImWchar l, ImWchar r);
 };
 
 // Font flags
@@ -3893,6 +3927,7 @@ struct ImFont
 {
     // [Internal] Members: Hot ~12-20 bytes
     ImFontBaked*                LastBaked;          // 4-8   // Cache last bound baked. NEVER USE DIRECTLY. Use GetFontBaked().
+    ImVector<ImFontKerningPair> KerningPairs;
     ImFontAtlas*                ContainerAtlas;     // 4-8   // What we have been loaded into.
     ImFontFlags                 Flags;              // 4     // Font flags.
     float                       CurrentRasterizerDensity;    // Current rasterizer density. This is a varying state of the font.
@@ -3917,6 +3952,7 @@ struct ImFont
     IMGUI_API bool              IsGlyphInFont(ImWchar c);
     bool                        IsLoaded() const                { return ContainerAtlas != NULL; }
     const char*                 GetDebugName() const            { return Sources.Size ? Sources[0]->Name : "<unknown>"; } // Fill ImFontConfig::Name.
+    IMGUI_API void              AddKerningPairs(const ImFontKerningPair* pairs_begin, const ImFontKerningPair* pairs_end);
 
     // [Internal] Don't use!
     // 'max_width' stops rendering after a certain width (could be turned into a 2d size). FLT_MAX to disable.

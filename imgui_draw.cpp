@@ -41,6 +41,7 @@ Index of this file:
 
 #include <stdio.h>      // vsnprintf, sscanf, printf
 #include <stdint.h>     // intptr_t
+#include <map>
 
 // Visual Studio warnings
 #ifdef _MSC_VER
@@ -3763,7 +3764,7 @@ void ImFontAtlasBakedDiscardFontGlyph(ImFontAtlas* atlas, ImFont* font, ImFontBa
     IM_ASSERT(glyph >= baked->Glyphs.Data && glyph < baked->Glyphs.Data + baked->Glyphs.Size);
     IM_UNUSED(font);
     baked->IndexLookup[c] = IM_FONTGLYPH_INDEX_UNUSED;
-    baked->IndexAdvanceX[c] = baked->FallbackAdvanceX;
+    baked->IndexData[c] = ImFontIndexData(baked->FallbackAdvanceX);
 }
 
 ImFontBaked* ImFontAtlasBakedAdd(ImFontAtlas* atlas, ImFont* font, float font_size, float font_rasterizer_density, ImGuiID baked_id)
@@ -4396,10 +4397,10 @@ static bool ImFontAtlasBuildAcceptCodepointForSource(ImFontConfig* src, ImWchar 
 
 static void ImFontBaked_BuildGrowIndex(ImFontBaked* baked, int new_size)
 {
-    IM_ASSERT(baked->IndexAdvanceX.Size == baked->IndexLookup.Size);
+    IM_ASSERT(baked->IndexData.Size == baked->IndexLookup.Size);
     if (new_size <= baked->IndexLookup.Size)
         return;
-    baked->IndexAdvanceX.resize(new_size, -1.0f);
+    baked->IndexData.resize(new_size, ImFontIndexData());
     baked->IndexLookup.resize(new_size, IM_FONTGLYPH_INDEX_UNUSED);
 }
 
@@ -4464,7 +4465,7 @@ static ImFontGlyph* ImFontBaked_BuildLoadGlyph(ImFontBaked* baked, ImWchar codep
 
     // Mark index as not found, so we don't attempt the search twice
     ImFontBaked_BuildGrowIndex(baked, codepoint + 1);
-    baked->IndexAdvanceX[codepoint] = baked->FallbackAdvanceX;
+    baked->IndexData[codepoint] = ImFontIndexData(baked->FallbackAdvanceX);
     baked->IndexLookup[codepoint] = IM_FONTGLYPH_INDEX_NOT_FOUND;
     return NULL;
 }
@@ -4554,6 +4555,98 @@ static bool ImGui_ImplStbTrueType_FontSrcInit(ImFontAtlas* atlas, ImFontConfig* 
         bd_font_data->ScaleFactor = stbtt_ScaleForMappingEmToPixels(&bd_font_data->FontInfo, 1.0f);
     if (src->MergeMode && src->SizePixels != 0.0f)
         bd_font_data->ScaleFactor *= src->SizePixels / src->DstFont->Sources[0]->SizePixels; // FIXME-NEWATLAS: Should tidy up that a bit
+
+    if (bd_font_data->FontInfo.kern || bd_font_data->FontInfo.gpos) {
+        ImVector<ImVector<ImWchar>> glyph_index_to_codepoint_map;
+        glyph_index_to_codepoint_map.resize(0x10000, ImVector<ImWchar>());
+
+        for (int i = 0; i < 0x10000; i++) {
+            const auto glyph_index = stbtt_FindGlyphIndex(&bd_font_data->FontInfo, i);
+            if (glyph_index == 0)
+                continue;
+
+            glyph_index_to_codepoint_map[glyph_index].push_back((ImWchar)i);
+        }
+
+        if (const auto kern = bd_font_data->FontInfo.data + bd_font_data->FontInfo.kern) {
+            // kerning table version.
+            std::map<std::pair<uint16_t, uint16_t>, short> distance_map;
+            switch (ttUSHORT(kern))
+            {
+                case 0:
+                {
+                    auto subtable = kern + 4;
+                    for (auto remaining_subtables = ttUSHORT(kern + 2); remaining_subtables > 0; remaining_subtables--)
+                    {
+                        const auto format = ttBYTE(subtable + 4);
+                        const auto horizontal = ttBYTE(subtable + 5) & (1 << 0);
+                        const auto minimum = ttBYTE(subtable + 5) & (1 << 1);
+                        const auto override = ttBYTE(subtable + 5) & (1 << 3);
+                        auto data = subtable + 6;
+                        if (format == 0 && horizontal) {
+                            int num_pairs = ttUSHORT(data);
+                            data += 8;
+                            for (int i = 0; i < num_pairs; i++) {
+                                const auto left = ttUSHORT(data + 0);
+                                const auto right = ttUSHORT(data + 2);
+                                const auto value = ttSHORT(data + 4);
+                                data += 6;
+                                auto& v = distance_map[std::make_pair(left, right)];
+                                if (override)
+                                    v = value;
+                                else if (minimum)
+                                    v = std::max(v, value);
+                                else
+                                    v += value;
+                            }
+                        }
+                        subtable += ttUSHORT(subtable + 2);
+                    }
+                    break;
+                }
+
+                case 1:
+                {
+                    auto subtable = kern + 8;
+                    for (auto remaining_subtables = ttULONG(kern + 4); remaining_subtables > 0; remaining_subtables--)
+                    {
+                        const auto format = ttBYTE(subtable + 4);
+                        const auto flags = ttBYTE(subtable + 5);
+                        auto data = subtable + 8;
+                        if (format == 0 && flags == 0) {
+                            int num_pairs = ttUSHORT(data);
+                            data += 8;
+                            for (int i = 0; i < num_pairs; i++) {
+                                const auto left = ttUSHORT(data + 0);
+                                const auto right = ttUSHORT(data + 2);
+                                const auto value = ttSHORT(data + 4);
+                                data += 6;
+                                distance_map.insert_or_assign(std::make_pair(left, right), value);
+                            }
+                        }
+                        subtable += ttUSHORT(subtable + 2);
+                    }
+                    break;
+                }
+
+                default:
+                {
+                    // unsupported
+                    break;
+                }
+            }
+
+            ImVector<ImFontKerningPair> pairs;
+            for (const auto& d : distance_map) {
+                for (const auto& lc : glyph_index_to_codepoint_map[d.first.first]) {
+                    for (const auto& rc : glyph_index_to_codepoint_map[d.first.second]) {
+                        pairs.push_back(ImFontKerningPair(lc, rc, d.second * bd_font_data->ScaleFactor));
+                    }
+                }
+            }
+            src->DstFont->AddKerningPairs(pairs.begin(), pairs.end());
+        }
+    }
 
     return true;
 }
@@ -5027,7 +5120,7 @@ void ImFontBaked::ClearOutputData()
 {
     FallbackAdvanceX = 0.0f;
     Glyphs.clear();
-    IndexAdvanceX.clear();
+    IndexData.clear();
     IndexLookup.clear();
     FallbackGlyphIndex = -1;
     Ascent = Descent = 0.0f;
@@ -5068,6 +5161,51 @@ bool ImFont::IsGlyphRangeUnused(unsigned int c_begin, unsigned int c_last)
                 return false;
     return true;
 }
+
+void ImFont::AddKerningPairs(const ImFontKerningPair* pairs_begin, const ImFontKerningPair* pairs_end)
+{
+    if (!pairs_begin && !pairs_end) {
+        ImQsort(KerningPairs.begin(), KerningPairs.size(), sizeof(ImFontKerningPair), &ImFontKerningPair::PairComparator);
+        return;
+    }
+    ImVector<ImFontKerningPair> sources;
+    sources.resize(KerningPairs.size() + (pairs_end - pairs_begin));
+    memcpy(sources.begin(), pairs_begin, (pairs_end - pairs_begin) * sizeof(ImFontKerningPair));
+    ImQsort(sources.begin(), pairs_end - pairs_begin, sizeof(ImFontKerningPair), &ImFontKerningPair::PairComparator);
+
+    ImSpan<ImFontKerningPair> s1(sources.begin(), sources.begin() + (pairs_end - pairs_begin));
+    ImSpan<ImFontKerningPair> s2(sources.begin() + (pairs_end - pairs_begin), sources.end());
+
+    KerningPairs.resize(KerningPairs.size() + sources.size());
+    auto wp = KerningPairs.begin();
+    while (s1.size() > 0 && s2.size() > 0)
+    {
+        if (s1.Data->Right > s2.Data->Right)
+            *wp++ = *s2.Data++;
+        else if (s1.Data->Right < s2.Data->Right)
+            *wp++ = *s1.Data++;
+        else
+        {
+            if (s1.Data->Left > s2.Data->Left)
+                *wp++ = *s2.Data++;
+            else if (s1.Data->Left < s2.Data->Left)
+                *wp++ = *s1.Data++;
+            else
+            {
+                *wp++ = *s1.Data++;
+                ++s2.Data;
+            }
+        }
+    }
+
+    memcpy(wp, s1.Data, s1.size_in_bytes());
+    wp += s1.size();
+    memcpy(wp, s2.Data, s2.size_in_bytes());
+    wp += s2.size();
+
+    KerningPairs.resize(wp - KerningPairs.begin());
+}
+
 
 // x0/y0/x1/y1 are offset from the character upper-left layout position, in pixels. Therefore x0/y0 are often fairly close to zero.
 // Not to be mistaken with texture coordinates, which are held by u0/v0/u1/v1 in normalized format (0.0..1.0 on each texture axis).
@@ -5114,10 +5252,32 @@ ImFontGlyph* ImFontAtlasBakedAddFontGlyph(ImFontAtlas* atlas, ImFontBaked* baked
     if (glyph->Colored)
         atlas->TexPixelsUseColors = atlas->TexData->UseColors = true;
 
+    glyph->KerningPairOffset = -1;
+    if (glyph->Visible)
+    {
+        int low = 0;
+        int high = baked->ContainerFont->KerningPairs.size() - 1;
+        while (low <= high) {
+            int mid = low + (high - low) / 2;
+            auto& mid_pair = baked->ContainerFont->KerningPairs.Data[mid];
+            const auto cmp = (int)glyph->Codepoint - (int)mid_pair.Right;
+            if (cmp < 0)
+                high = mid - 1;
+            else if (cmp > 0)
+                low = mid + 1;
+            else {
+                while (mid > 0 && baked->ContainerFont->KerningPairs.Data[mid - 1].Right == glyph->Codepoint)
+                    --mid;
+                glyph->KerningPairOffset = mid;
+                break;
+            }
+        }
+    }
+
     // Update lookup tables
     const int codepoint = glyph->Codepoint;
     ImFontBaked_BuildGrowIndex(baked, codepoint + 1);
-    baked->IndexAdvanceX[codepoint] = glyph->AdvanceX;
+    baked->IndexData[codepoint] = ImFontIndexData(glyph->AdvanceX, glyph->Visible ? glyph->X1 : glyph->AdvanceX, glyph->KerningPairOffset);
     baked->IndexLookup[codepoint] = (ImU16)glyph_idx;
     const int page_n = codepoint / 8192;
     baked->ContainerFont->Used8kPagesMap[page_n >> 3] |= 1 << (page_n & 7);
@@ -5186,6 +5346,45 @@ bool ImFontBaked::IsGlyphLoaded(ImWchar c)
     return false;
 }
 
+float ImFontBaked::GetKerningPairAdjustment(ImWchar l, ImWchar r)
+{
+    if (l >= (unsigned int)IndexData.Size || r >= (unsigned int)IndexData.Size)
+        return 0;
+
+    int offset = IndexData[r].KerningPairOffset;
+    if (offset < 0)
+        return 0;
+
+    // Handle cases where the kerning pairs are nearby
+    int low = offset + 32 > ContainerFont->KerningPairs.Size ? offset + 32 : ContainerFont->KerningPairs.Size;
+    for (; offset < low; offset++)
+    {
+        if (ContainerFont->KerningPairs[offset].Right != r)
+            return 0;
+        if (ContainerFont->KerningPairs[offset].Left == l)
+            return IM_ROUND(ContainerFont->KerningPairs[offset].Distance * Size);
+    }
+
+    int high = ContainerFont->KerningPairs.Size - 1;
+    const ImFontKerningPair lookup(l, r, 0);
+    while (low <= high)
+    {
+        int mid = low + (high - low) / 2;
+        auto& mid_pair = ContainerFont->KerningPairs.Data[mid];
+        const auto cmp = ImFontKerningPair::PairComparator(&lookup, &mid_pair);
+
+        if (cmp < 0)
+            high = mid - 1;
+        else if (cmp > 0)
+            low = mid + 1;
+        else
+            return IM_ROUND(mid_pair.Distance * Size);
+    }
+
+    return 0;
+}
+
+
 // This is not fast query
 bool ImFont::IsGlyphInFont(ImWchar c)
 {
@@ -5202,19 +5401,22 @@ bool ImFont::IsGlyphInFont(ImWchar c)
 
 // This is manually inlined in CalcTextSizeA() and CalcWordWrapPosition(), with a non-inline call to BuildLoadGlyphGetAdvanceOrFallback().
 IM_MSVC_RUNTIME_CHECKS_OFF
-float ImFontBaked::GetCharAdvance(ImWchar c)
+ImFontIndexData ImFontBaked::GetCharAdvance(ImWchar c)
 {
-    if ((int)c < IndexAdvanceX.Size)
+    if ((int)c < IndexData.Size)
     {
         // Missing glyphs fitting inside index will have stored FallbackAdvanceX already.
-        const float x = IndexAdvanceX.Data[c];
-        if (x >= 0.0f)
+        const ImFontIndexData x = IndexData.Data[c];
+        if (x.IsValid())
             return x;
     }
 
     // Same as BuildLoadGlyphGetAdvanceOrFallback():
     const ImFontGlyph* glyph = ImFontBaked_BuildLoadGlyph(this, c);
-    return glyph ? glyph->AdvanceX : FallbackAdvanceX;
+    if (glyph)
+        return ImFontIndexData{glyph->AdvanceX, glyph->X1};
+    else
+        return ImFontIndexData{FallbackAdvanceX, FallbackAdvanceX};
 }
 IM_MSVC_RUNTIME_CHECKS_RESTORE
 
@@ -5316,8 +5518,10 @@ const char* ImFont::CalcWordWrapPosition(float size, const char* text, const cha
     ImFontBaked* baked = GetFontBaked(size);
     const float scale = size / baked->Size;
 
-    float line_width = 0.0f;
-    float word_width = 0.0f;
+    const bool use_kerning = !(GImGui->IO.ConfigFlags & ImGuiConfigFlags_NoKerning);
+
+    float line_cursor = 0.0f;
+    float word_cursor = 0.0f;
     float blank_width = 0.0f;
     wrap_width /= scale; // We work with unscaled widths to avoid scaling every characters
 
@@ -5326,6 +5530,7 @@ const char* ImFont::CalcWordWrapPosition(float size, const char* text, const cha
     bool inside_word = true;
 
     const char* s = text;
+    unsigned int last_c = 0;
     IM_ASSERT(text_end != NULL);
     while (s < text_end)
     {
@@ -5340,37 +5545,44 @@ const char* ImFont::CalcWordWrapPosition(float size, const char* text, const cha
         {
             if (c == '\n')
             {
-                line_width = word_width = blank_width = 0.0f;
+                line_cursor = word_cursor = blank_width = 0.0f;
                 inside_word = true;
                 s = next_s;
+                last_c = c;
                 continue;
             }
             if (c == '\r')
             {
                 s = next_s;
+                last_c = c;
                 continue;
             }
         }
 
         // Optimized inline version of 'float char_width = GetCharAdvance((ImWchar)c);'
-        float char_width = (c < (unsigned int)baked->IndexAdvanceX.Size) ? baked->IndexAdvanceX.Data[c] : -1.0f;
-        if (char_width < 0.0f)
+        ImFontIndexData char_width = (c < (unsigned int)baked->IndexData.Size) ? baked->IndexData.Data[c] : ImFontIndexData();
+        if (!char_width.IsValid())
             char_width = BuildLoadGlyphGetAdvanceOrFallback(baked, c);
 
         if (ImCharIsBlankW(c))
         {
             if (inside_word)
             {
-                line_width += blank_width;
+                line_cursor += blank_width;
                 blank_width = 0.0f;
                 word_end = s;
             }
-            blank_width += char_width;
+            c = ' ';
+            blank_width += char_width.AdvanceX;
+            if (use_kerning)
+                blank_width += baked->GetKerningPairAdjustment((ImWchar)last_c, (ImWchar)c);
             inside_word = false;
         }
         else
         {
-            word_width += char_width;
+            word_cursor += char_width.AdvanceX;
+            if (use_kerning)
+                word_cursor += baked->GetKerningPairAdjustment((ImWchar)last_c, (ImWchar)c);
             if (inside_word)
             {
                 word_end = next_s;
@@ -5378,8 +5590,8 @@ const char* ImFont::CalcWordWrapPosition(float size, const char* text, const cha
             else
             {
                 prev_word_end = word_end;
-                line_width += word_width + blank_width;
-                word_width = blank_width = 0.0f;
+                line_cursor += word_cursor + blank_width;
+                word_cursor = blank_width = 0.0f;
             }
 
             // Allow wrapping after punctuation.
@@ -5387,7 +5599,8 @@ const char* ImFont::CalcWordWrapPosition(float size, const char* text, const cha
         }
 
         // We ignore blank width at the end of the line (they can be skipped)
-        if (line_width + word_width > wrap_width)
+        float word_width = word_cursor + char_width.Width - char_width.AdvanceX;
+        if (line_cursor + word_width > wrap_width)
         {
             // Words that cannot possibly fit within an entire line will be cut anywhere.
             if (word_width < wrap_width)
@@ -5396,6 +5609,7 @@ const char* ImFont::CalcWordWrapPosition(float size, const char* text, const cha
         }
 
         s = next_s;
+        last_c = c;
     }
 
     // Wrap_width is too small to fit anything. Force displaying 1 character to minimize the height discontinuity.
@@ -5414,6 +5628,8 @@ ImVec2 ImFont::CalcTextSizeA(float size, float max_width, float wrap_width, cons
     ImFontBaked* baked = GetFontBaked(size);
     const float scale = size / baked->Size;
 
+    const bool use_kerning = !(GImGui->IO.ConfigFlags & ImGuiConfigFlags_NoKerning);
+
     ImVec2 text_size = ImVec2(0, 0);
     float line_width = 0.0f;
 
@@ -5421,6 +5637,7 @@ ImVec2 ImFont::CalcTextSizeA(float size, float max_width, float wrap_width, cons
     const char* word_wrap_eol = NULL;
 
     const char* s = text_begin;
+    unsigned int last_c = 0;
     while (s < text_end)
     {
         if (word_wrap_enabled)
@@ -5456,25 +5673,30 @@ ImVec2 ImFont::CalcTextSizeA(float size, float max_width, float wrap_width, cons
                 text_size.x = ImMax(text_size.x, line_width);
                 text_size.y += line_height;
                 line_width = 0.0f;
+                last_c = c;
                 continue;
             }
-            if (c == '\r')
+            if (c == '\r') {
+                last_c = c;
                 continue;
+            }
         }
 
         // Optimized inline version of 'float char_width = GetCharAdvance((ImWchar)c);'
-        float char_width = (c < (unsigned int)baked->IndexAdvanceX.Size) ? baked->IndexAdvanceX.Data[c] : -1.0f;
-        if (char_width < 0.0f)
+        ImFontIndexData char_width = (c < (unsigned int)baked->IndexData.Size) ? baked->IndexData.Data[c] : ImFontIndexData();
+        if (!char_width.IsValid())
             char_width = BuildLoadGlyphGetAdvanceOrFallback(baked, c);
         char_width *= scale;
 
-        if (line_width + char_width >= max_width)
+        float kerning_distance = use_kerning ? baked->GetKerningPairAdjustment((ImWchar)last_c, (ImWchar)c) * scale : 0;
+        if (line_width + kerning_distance + char_width.Width > max_width)
         {
             s = prev_s;
             break;
         }
 
-        line_width += char_width;
+        line_width += char_width.AdvanceX + kerning_distance;
+        last_c = c;
     }
 
     if (text_size.x < line_width)
@@ -5544,6 +5766,8 @@ begin:
     const float line_height = size;
     ImFontBaked* baked = GetFontBaked(size);
 
+    const bool use_kerning = !(GImGui->IO.ConfigFlags & ImGuiConfigFlags_NoKerning);
+
     const float scale = size / baked->Size;
     const float origin_x = x;
     const bool word_wrap_enabled = (wrap_width > 0.0f);
@@ -5599,6 +5823,7 @@ begin:
     const ImU32 col_untinted = col | ~IM_COL32_A_MASK;
     const char* word_wrap_eol = NULL;
 
+    unsigned int last_c = 0;
     while (s < text_end)
     {
         if (word_wrap_enabled)
@@ -5634,19 +5859,25 @@ begin:
                 y += line_height;
                 if (y > clip_rect.w)
                     break; // break out of main loop
+                last_c = c;
                 continue;
             }
             if (c == '\r')
+            {
+                last_c = c;
                 continue;
+            }
         }
 
         const ImFontGlyph* glyph = baked->FindGlyph((ImWchar)c);
         //if (glyph == NULL)
         //    continue;
 
-        float char_width = glyph->AdvanceX * scale;
+        float advance_x = glyph->AdvanceX * scale;
         if (glyph->Visible)
         {
+            if (use_kerning)
+                x += baked->GetKerningPairAdjustment((ImWchar)last_c, (ImWchar)c) * scale;
             // We don't do a second finer clipping test on the Y axis as we've already skipped anything before clip_rect.y and exit once we pass clip_rect.w
             float x1 = x + glyph->X0 * scale;
             float x2 = x + glyph->X1 * scale;
@@ -5685,7 +5916,7 @@ begin:
                     }
                     if (y1 >= y2)
                     {
-                        x += char_width;
+                        x += advance_x;
                         continue;
                     }
                 }
@@ -5707,7 +5938,8 @@ begin:
                 }
             }
         }
-        x += char_width;
+        x += advance_x;
+        last_c = c;
     }
 
     // Edge case: calling RenderText() with unloaded glyphs triggering texture change. It doesn't happen via ImGui:: calls because CalcTextSize() is always used.

@@ -3969,10 +3969,14 @@ static ImVec2 InputTextCalcTextSize(ImGuiContext* ctx, const char* text_begin, c
     const float line_height = g.FontSize;
     const float scale = line_height / baked->Size;
 
+    const bool use_kerning = !(GImGui->IO.ConfigFlags & ImGuiConfigFlags_NoKerning);
+
     ImVec2 text_size = ImVec2(0, 0);
+    float line_cursor = 0.0f;
     float line_width = 0.0f;
 
     const char* s = text_begin;
+    unsigned int last_c = 0;
     while (s < text_end)
     {
         unsigned int c = (unsigned int)*s;
@@ -3985,15 +3989,25 @@ static ImVec2 InputTextCalcTextSize(ImGuiContext* ctx, const char* text_begin, c
         {
             text_size.x = ImMax(text_size.x, line_width);
             text_size.y += line_height;
-            line_width = 0.0f;
+            line_cursor = line_width = 0.0f;
             if (stop_on_new_line)
                 break;
+            last_c = c;
             continue;
         }
-        if (c == '\r')
+        if (c == '\r') {
+            last_c = c;
             continue;
+        }
 
-        line_width += baked->GetCharAdvance((ImWchar)c) * scale;
+        ImFontIndexData char_width = baked->GetCharAdvance((ImWchar)c);
+        char_width *= scale;
+
+        float kerning_distance = use_kerning ? baked->GetKerningPairAdjustment((ImWchar)last_c, (ImWchar)c) * scale : 0;
+        line_width = line_cursor + kerning_distance + char_width.Width;
+        line_cursor += kerning_distance + char_width.AdvanceX;
+
+        last_c = c;
     }
 
     if (text_size.x < line_width)
@@ -4020,7 +4034,25 @@ namespace ImStb
 {
 static int     STB_TEXTEDIT_STRINGLEN(const ImGuiInputTextState* obj)                             { return obj->TextLen; }
 static char    STB_TEXTEDIT_GETCHAR(const ImGuiInputTextState* obj, int idx)                      { IM_ASSERT(idx <= obj->TextLen); return obj->TextSrc[idx]; }
-static float   STB_TEXTEDIT_GETWIDTH(ImGuiInputTextState* obj, int line_start_idx, int char_idx)  { unsigned int c; ImTextCharFromUtf8(&c, obj->TextSrc + line_start_idx + char_idx, obj->TextSrc + obj->TextLen); if ((ImWchar)c == '\n') return IMSTB_TEXTEDIT_GETWIDTH_NEWLINE; ImGuiContext& g = *obj->Ctx; return g.FontBaked->GetCharAdvance((ImWchar)c) * g.FontBakedScale; }
+static float   STB_TEXTEDIT_GETWIDTH(ImGuiInputTextState* obj, int line_start_idx, int char_idx) {
+    unsigned int c;
+    ImTextCharFromUtf8(&c, obj->TextSrc + line_start_idx + char_idx, obj->TextSrc + obj->TextLen);
+    if ((ImWchar)c == '\n') return IMSTB_TEXTEDIT_GETWIDTH_NEWLINE;
+    ImGuiContext& g = *obj->Ctx;
+
+    if (!(GImGui->IO.ConfigFlags & ImGuiConfigFlags_NoKerning)) {
+        float kerning_adjustment = 0;
+        if (char_idx > 0) {
+            const char* prev = ImTextFindPreviousUtf8Codepoint(obj->TextSrc, obj->TextSrc + char_idx);
+            unsigned int last_c;
+            ImTextCharFromUtf8(&last_c, prev, obj->TextSrc + char_idx);
+            kerning_adjustment = g.FontBaked->GetKerningPairAdjustment((ImWchar)last_c, (ImWchar)c) * g.FontBakedScale;
+        }
+        return (g.FontBaked->GetCharAdvance((ImWchar)c).Width + kerning_adjustment) * g.FontBakedScale;
+    } else {
+        return (g.FontBaked->GetCharAdvance((ImWchar)c).Width) * g.FontBakedScale;
+    }
+}
 static char    STB_TEXTEDIT_NEWLINE = '\n';
 static void    STB_TEXTEDIT_LAYOUTROW(StbTexteditRow* r, ImGuiInputTextState* obj, int line_start_idx)
 {
@@ -4324,13 +4356,13 @@ void ImGui::PushPasswordFont()
 {
     ImGuiContext& g = *GImGui;
     ImFontBaked* backup = &g.InputTextPasswordFontBackupBaked;
-    IM_ASSERT(backup->IndexAdvanceX.Size == 0 && backup->IndexLookup.Size == 0);
+    IM_ASSERT(backup->IndexData.Size == 0 && backup->IndexLookup.Size == 0);
     ImFontGlyph* glyph = g.FontBaked->FindGlyph('*');
     g.InputTextPasswordFontBackupFlags = g.Font->Flags;
     backup->FallbackGlyphIndex = g.FontBaked->FallbackGlyphIndex;
     backup->FallbackAdvanceX = g.FontBaked->FallbackAdvanceX;
     backup->IndexLookup.swap(g.FontBaked->IndexLookup);
-    backup->IndexAdvanceX.swap(g.FontBaked->IndexAdvanceX);
+    backup->IndexData.swap(g.FontBaked->IndexData);
     g.Font->Flags |= ImFontFlags_NoLoadGlyphs;
     g.FontBaked->FallbackGlyphIndex = g.FontBaked->Glyphs.index_from_ptr(glyph);
     g.FontBaked->FallbackAdvanceX = glyph->AdvanceX;
@@ -4344,8 +4376,8 @@ void ImGui::PopPasswordFont()
     g.FontBaked->FallbackGlyphIndex = backup->FallbackGlyphIndex;
     g.FontBaked->FallbackAdvanceX = backup->FallbackAdvanceX;
     g.FontBaked->IndexLookup.swap(backup->IndexLookup);
-    g.FontBaked->IndexAdvanceX.swap(backup->IndexAdvanceX);
-    IM_ASSERT(backup->IndexAdvanceX.Size == 0 && backup->IndexLookup.Size == 0);
+    g.FontBaked->IndexData.swap(backup->IndexData);
+    IM_ASSERT(backup->IndexData.Size == 0 && backup->IndexLookup.Size == 0);
 }
 
 // Return false to discard a character.
@@ -5260,6 +5292,7 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
 
     // Render text. We currently only render selection when the widget is active or while scrolling.
     // FIXME: We could remove the '&& render_cursor' to keep rendering selection when inactive.
+    float scale = g.FontSize / g.FontBaked->Size;
     if (render_cursor || render_selection)
     {
         IM_ASSERT(state != NULL);
@@ -5307,6 +5340,25 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
             {
                 select_start_offset.x = InputTextCalcTextSize(&g, ImStrbol(selmin_ptr, text_begin), selmin_ptr).x;
                 select_start_offset.y = selmin_line_no * g.FontSize;
+
+                if (cursor_ptr != text_begin) {
+                    // It will snap the left border of the selection box to the left border of the first glyph selected when drawing selection.
+                    // Taking account of the above, snap the cursor too, if cursor is at the left border of the selection box.
+                    if (cursor_ptr == selmin_ptr) {
+                        unsigned int prev_c;
+                        ImTextCharFromUtf8(&prev_c, ImTextFindPreviousUtf8Codepoint(text_begin, selmin_ptr), text_end);
+                        cursor_offset.x += g.FontBaked->GetKerningPairAdjustment((ImWchar)prev_c, *selmin_ptr) * scale;
+                    }
+                }
+            }
+
+            // Set the cursor position between after advance width and after bounding width of the previous character.
+            if (const ImWchar prev_char = cursor_ptr != text_begin ? *(cursor_ptr - 1) : 0) {
+                if ((int)prev_char < g.FontBaked->IndexData.Size) {
+                    const auto& glyph = g.FontBaked->IndexData.Data[prev_char];
+                    if (glyph.IsValid())
+                        cursor_offset.x += (glyph.Width - glyph.AdvanceX) / 2;
+                }
             }
 
             // Store text height (note that we haven't calculated text width at all, see GitHub issues #383, #1224)
@@ -5371,9 +5423,35 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
                 }
                 else
                 {
+                    float left_adjustment = 0.0f;
+                    float right_adjustment = 0.0f;
+                    float kern_adjustment = 0.0f;
+
+                    if (const ImWchar prev_char = text_begin != p ? *(p - 1) : 0) {
+                        if ((int)prev_char < g.FontBaked->IndexData.Size) {
+                            const auto& glyph = g.FontBaked->IndexData.Data[prev_char];
+                            if (glyph.IsValid()) {
+                                left_adjustment = (glyph.Width - glyph.AdvanceX) / 2;
+                                kern_adjustment = g.FontBaked->GetKerningPairAdjustment(prev_char, *p);
+                            }
+                        }
+                    }
+
                     ImVec2 rect_size = InputTextCalcTextSize(&g, p, text_selected_end, &p, NULL, true);
-                    if (rect_size.x <= 0.0f) rect_size.x = IM_TRUNC(g.FontBaked->GetCharAdvance((ImWchar)' ') * 0.50f); // So we can see selected empty lines
-                    ImRect rect(rect_pos + ImVec2(0.0f, bg_offy_up - g.FontSize), rect_pos + ImVec2(rect_size.x, bg_offy_dn));
+                    if (rect_size.x <= 0.0f) rect_size.x = IM_TRUNC(g.FontBaked->GetCharAdvance((ImWchar)' ').Width * 0.50f); // So we can see selected empty lines
+
+                    if (const ImWchar last_char = text_begin != p ? *(p - 1) : 0) {
+                        if ((int)last_char < g.FontBaked->IndexData.Size) {
+                            const auto& glyph = g.FontBaked->IndexData.Data[last_char];
+                            if (glyph.IsValid())
+                                right_adjustment += (glyph.Width - glyph.AdvanceX) / 2;
+                        }
+                    }
+
+                    left_adjustment = (left_adjustment + kern_adjustment) * scale;
+                    right_adjustment = (right_adjustment + kern_adjustment) * scale;
+
+                    ImRect rect(rect_pos + ImVec2(left_adjustment, bg_offy_up - g.FontSize), rect_pos + ImVec2(rect_size.x + right_adjustment, bg_offy_dn));
                     rect.ClipWith(clip_rect);
                     if (rect.Overlaps(clip_rect))
                         draw_window->DrawList->AddRectFilled(rect.Min, rect.Max, bg_color);
