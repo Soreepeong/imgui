@@ -490,6 +490,8 @@ void ImGui::ShowDemoWindow(bool* p_open)
             ImGui::SameLine(); HelpMarker("Instruct backend to not alter mouse cursor shape and visibility.");
             ImGui::CheckboxFlags("io.ConfigFlags: NoKeyboard", &io.ConfigFlags, ImGuiConfigFlags_NoKeyboard);
             ImGui::SameLine(); HelpMarker("Instruct dear imgui to disable keyboard inputs and interactions.");
+            ImGui::CheckboxFlags("io.ConfigFlags: NoKerning", &io.ConfigFlags, ImGuiConfigFlags_NoKerning);
+            ImGui::SameLine(); HelpMarker("Instruct imgui to disable kerning when rendering and measuring text.");
 
             ImGui::Checkbox("io.ConfigInputTrickleEventQueue", &io.ConfigInputTrickleEventQueue);
             ImGui::SameLine(); HelpMarker("Enable input queue trickling: some types of events submitted during the same frame (e.g. button down + up) will be spread over multiple frames, improving interactions with low framerates.");
@@ -1809,7 +1811,7 @@ static void DemoWindowWidgetsImages()
         // - Consider using the lower-level ImDrawList::AddImage() API, via ImGui::GetWindowDrawList()->AddImage().
         // - Read https://github.com/ocornut/imgui/blob/master/docs/FAQ.md
         // - Read https://github.com/ocornut/imgui/wiki/Image-Loading-and-Displaying-Examples
-        ImTextureID my_tex_id = io.Fonts->TexID;
+        ImTextureID my_tex_id = io.Fonts->Textures[0].TexID;
         float my_tex_w = (float)io.Fonts->TexWidth;
         float my_tex_h = (float)io.Fonts->TexHeight;
         {

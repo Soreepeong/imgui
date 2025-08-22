@@ -472,6 +472,7 @@ namespace ImGui
     // - Use the ShowStyleEditor() function to interactively see/edit the colors.
     IMGUI_API ImFont*       GetFont();                                                      // get current font
     IMGUI_API float         GetFontSize();                                                  // get current font size (= height in pixels) of current font with current scale applied
+    IMGUI_API ImTextureID   GetFontTexIdWhitePixel();                                       // get texture ID for a white pixel.
     IMGUI_API ImVec2        GetFontTexUvWhitePixel();                                       // get UV coordinate for a white pixel, useful to draw custom shapes via the ImDrawList API
     IMGUI_API ImU32         GetColorU32(ImGuiCol idx, float alpha_mul = 1.0f);              // retrieve given style color with style alpha applied and optional extra alpha multiplier, packed as a 32-bit value suitable for ImDrawList
     IMGUI_API ImU32         GetColorU32(const ImVec4& col);                                 // retrieve given color with style alpha applied, packed as a 32-bit value suitable for ImDrawList
@@ -1651,9 +1652,10 @@ enum ImGuiConfigFlags_
     ImGuiConfigFlags_NoMouse                = 1 << 4,   // Instruct dear imgui to disable mouse inputs and interactions.
     ImGuiConfigFlags_NoMouseCursorChange    = 1 << 5,   // Instruct backend to not alter mouse cursor shape and visibility. Use if the backend cursor changes are interfering with yours and you don't want to use SetMouseCursor() to change mouse cursor. You may want to honor requests from imgui by reading GetMouseCursor() yourself instead.
     ImGuiConfigFlags_NoKeyboard             = 1 << 6,   // Instruct dear imgui to disable keyboard inputs and interactions. This is done by ignoring keyboard events and clearing existing states.
+    ImGuiConfigFlags_NoKerning              = 1 << 7,   // Instruct imgui to ignore kerning when drawing all text.
 
     // [BETA] Docking
-    ImGuiConfigFlags_DockingEnable          = 1 << 7,   // Docking enable flags.
+    ImGuiConfigFlags_DockingEnable          = 1 << 8,   // Docking enable flags.
 
     // [BETA] Viewports
     // When using viewports it is recommended that your default value for ImGuiCol_WindowBg is opaque (Alpha=1.0) so transition to a viewport won't be noticeable.
@@ -3403,6 +3405,7 @@ struct ImFontConfig
     unsigned int    FontBuilderFlags;       // 0        // Settings for custom font builder. THIS IS BUILDER IMPLEMENTATION DEPENDENT. Leave as zero if unsure.
     float           RasterizerMultiply;     // 1.0f     // Linearly brighten (>1.0f) or darken (<1.0f) font output. Brightening small fonts may be a good workaround to make them more readable. This is a silly thing we may remove in the future.
     float           RasterizerDensity;      // 1.0f     // DPI scale for rasterization, not altering other font metrics: make it easy to swap between e.g. a 100% and a 400% fonts for a zooming display. IMPORTANT: If you increase this it is expected that you increase font scale accordingly, otherwise quality may look lowered.
+    float           RasterizerGamma;        // 1.4f     // Adjust font gamma.
     ImWchar         EllipsisChar;           // 0        // Explicitly specify Unicode codepoint of ellipsis character. When fonts are being merged first specified ellipsis will be used.
 
     // [Internal]
@@ -3418,8 +3421,9 @@ struct ImFontGlyph
 {
     unsigned int    Colored : 1;        // Flag to indicate glyph is colored and should generally ignore tinting (make it usable with no shift on little-endian as this is used in loops)
     unsigned int    Visible : 1;        // Flag to indicate glyph has no visible pixels (e.g. space). Allow early out when rendering.
-    unsigned int    Codepoint : 30;     // 0x0000..0x10FFFF
-    float           AdvanceX;           // Horizontal distance to advance layout with
+    unsigned int    TextureIndex : 9;   // Texture index.
+    unsigned int    Codepoint : 21;     // 0x0000..0x10FFFF
+    float           AdvanceX;           // Distance to next character (= data from font + ImFontConfig::GlyphExtraSpacing.x baked in)
     float           X0, Y0, X1, Y1;     // Glyph corners
     float           U0, V0, U1, V1;     // Texture coordinates
 };
@@ -3447,13 +3451,22 @@ struct ImFontAtlasCustomRect
 
     // [Internal]
     unsigned short  Width, Height;  // Input    // Desired rectangle dimension
-    unsigned int    GlyphID : 31;   // Input    // For custom font glyphs only (ID < 0x110000)
+    unsigned int    Reserved : 1;   //
+    unsigned int    TextureIndex : 9;//Output   // Texture index.
+    unsigned int    GlyphID : 21;   // Input    // For custom font glyphs only (ID < 0x110000)
     unsigned int    GlyphColored : 1; // Input  // For custom font glyphs only: glyph is colored, removed tinting.
     float           GlyphAdvanceX;  // Input    // For custom font glyphs only: glyph xadvance
     ImVec2          GlyphOffset;    // Input    // For custom font glyphs only: glyph display offset
     ImFont*         Font;           // Input    // For custom font glyphs only: target font
-    ImFontAtlasCustomRect()         { X = Y = 0xFFFF; Width = Height = 0; GlyphID = 0; GlyphColored = 0; GlyphAdvanceX = 0.0f; GlyphOffset = ImVec2(0, 0); Font = NULL; }
+    ImFontAtlasCustomRect()         { X = Y = 0xFFFF; Width = Height = 0; Reserved = 0; TextureIndex = 0; GlyphColored = 0; GlyphID = 0; GlyphAdvanceX = 0.0f; GlyphOffset = ImVec2(0, 0); Font = NULL; }
     bool IsPacked() const           { return X != 0xFFFF; }
+};
+
+struct ImFontAtlasTexture
+{
+    ImTextureID       TexID;              // User data to refer to the texture once it has been uploaded to user's graphic systems. It is passed back to you during rendering via the ImDrawCmd structure.
+    unsigned char*    TexPixelsAlpha8;    // 1 component per pixel, each component is unsigned 8-bit. Total size = TexWidth * TexHeight
+    unsigned int*     TexPixelsRGBA32;    // 4 component per pixel, each component is unsigned 8-bit. Total size = TexWidth * TexHeight * 4
 };
 
 // Flags for ImFontAtlas build
@@ -3503,10 +3516,11 @@ struct ImFontAtlas
     // Building in RGBA32 format is provided for convenience and compatibility, but note that unless you manually manipulate or copy color data into
     // the texture (e.g. when using the AddCustomRect*** api), then the RGB pixels emitted will always be white (~75% of memory/bandwidth waste.
     IMGUI_API bool              Build();                    // Build pixels data. This is called automatically for you by the GetTexData*** functions.
-    IMGUI_API void              GetTexDataAsAlpha8(unsigned char** out_pixels, int* out_width, int* out_height, int* out_bytes_per_pixel = NULL);  // 1 byte per-pixel
-    IMGUI_API void              GetTexDataAsRGBA32(unsigned char** out_pixels, int* out_width, int* out_height, int* out_bytes_per_pixel = NULL);  // 4 bytes-per-pixel
+    IMGUI_API void              GetTexDataAsAlpha8(int texture_index, unsigned char** out_pixels, int* out_width, int* out_height, int* out_bytes_per_pixel = NULL);  // 1 byte per-pixel
+    IMGUI_API void              GetTexDataAsRGBA32(int texture_index, unsigned char** out_pixels, int* out_width, int* out_height, int* out_bytes_per_pixel = NULL);  // 4 bytes-per-pixel
     bool                        IsBuilt() const             { return Fonts.Size > 0 && TexReady; } // Bit ambiguous: used to detect when user didn't build texture but effectively we should check TexID != 0 except that would be backend dependent...
-    void                        SetTexID(ImTextureID id)    { TexID = id; }
+    void                        SetTexID(int texture_index, ImTextureID id) { Textures[texture_index].TexID = id; }
+    void                        ClearTexID(ImTextureID nullId) { for (int i = 0; i < Textures.Size; i++) Textures[i].TexID = nullId; }
 
     //-------------------------------------------
     // Glyph Ranges
@@ -3550,8 +3564,9 @@ struct ImFontAtlas
 
     // Input
     ImFontAtlasFlags            Flags;              // Build flags (see ImFontAtlasFlags_)
-    ImTextureID                 TexID;              // User data to refer to the texture once it has been uploaded to user's graphic systems. It is passed back to you during rendering via the ImDrawCmd structure.
+    ImVector<ImFontAtlasTexture>Textures;           // User data to refer to the texture once it has been uploaded to user's graphic systems. It is passed back to you during rendering via the ImDrawCmd structure.
     int                         TexDesiredWidth;    // Texture width desired by user before Build(). Must be a power-of-two. If have many glyphs your graphics API have texture size restrictions you may want to increase texture width to decrease height.
+    int                         TexDesiredHeight;   // Texture height desired by user before Build(). Must be a power-of-two.
     int                         TexGlyphPadding;    // FIXME: Should be called "TexPackPadding". Padding between glyphs within texture in pixels. Defaults to 1. If your rendering method doesn't rely on bilinear filtering you may set this to 0 (will also need to set AntiAliasedLinesUseTex = false).
     void*                       UserData;           // Store your own atlas related user-data (if e.g. you have multiple font atlas).
 
@@ -3560,8 +3575,6 @@ struct ImFontAtlas
     bool                        Locked;             // Marked as Locked by ImGui::NewFrame() so attempt to modify the atlas will assert.
     bool                        TexReady;           // Set when texture was built matching current font input
     bool                        TexPixelsUseColors; // Tell whether our texture data is known to use colors (rather than just alpha channel), in order to help backend select a format.
-    unsigned char*              TexPixelsAlpha8;    // 1 component per pixel, each component is unsigned 8-bit. Total size = TexWidth * TexHeight
-    unsigned int*               TexPixelsRGBA32;    // 4 component per pixel, each component is unsigned 8-bit. Total size = TexWidth * TexHeight * 4
     int                         TexWidth;           // Texture width calculated during Build().
     int                         TexHeight;          // Texture height calculated during Build().
     ImVec2                      TexUvScale;         // = (1.0f/TexWidth, 1.0f/TexHeight)
@@ -3584,19 +3597,40 @@ struct ImFontAtlas
     //typedef ImFontGlyphRangesBuilder GlyphRangesBuilder;      // OBSOLETED in 1.67+
 };
 
+// Kerning information between two glyphs
+struct ImFontKerningPair
+{
+    ImWchar Left;              // Glyph that comes to the left of the kerning pair.
+    ImWchar Right;             // Glyph that comes to the right of the kerning pair.
+    float AdvanceXAdjustment;  // Adjustment to advance width in pixel unit.
+};
+
+struct ImFontGlyphHotData
+{
+    float AdvanceX;
+    float OccupiedWidth;
+    unsigned int KerningPairUseBisect : 1;
+    unsigned int KerningPairOffset : 19;
+    unsigned int KerningPairCount : 12;
+};
+
+static constexpr int ImFont_FrequentKerningPairs_MaxCodepoint = 128;
+
 // Font runtime data and rendering
 // ImFontAtlas automatically loads a default embedded font for you when you call GetTexDataAsAlpha8() or GetTexDataAsRGBA32().
 struct ImFont
 {
-    // [Internal] Members: Hot ~20/24 bytes (for CalcTextSize)
-    ImVector<float>             IndexAdvanceX;      // 12-16 // out // Sparse. Glyphs->AdvanceX in a directly indexable way (cache-friendly for CalcTextSize functions which only this info, and are often bottleneck in large UI).
-    float                       FallbackAdvanceX;   // 4     // out // = FallbackGlyph->AdvanceX
+    // [Internal] Members: Hot ~28/36 bytes (for CalcTextSize)
+    ImVector<ImFontGlyphHotData>IndexedHotData;     // 12-16 // out //            // Sparse. Various glyph information in a directly indexable way (cache-friendly for CalcTextSize
+    ImVector<float>             FrequentKerningPairs;//12-16 // out //            // Kerning pairs between characters in ASCII range.
     float                       FontSize;           // 4     // in  // Height of characters/line, set during loading (don't change after loading)
 
-    // [Internal] Members: Hot ~28/40 bytes (for RenderText loop)
+    // [Internal] Members: Hot ~44/64 bytes (for RenderText loop)
     ImVector<ImU16>             IndexLookup;        // 12-16 // out // Sparse. Index glyphs by Unicode code-point.
     ImVector<ImFontGlyph>       Glyphs;             // 12-16 // out // All glyphs.
+    ImVector<ImFontKerningPair> KerningPairs;       // 12-16 // out //            // All kerning pairs, in order of ascending right first and left second.
     ImFontGlyph*                FallbackGlyph;      // 4-8   // out // = FindGlyph(FontFallbackChar)
+    ImFontGlyphHotData*         FallbackHotData;    // 4-8   // out // = &IndexedHotData[FontFallbackChar]
 
     // [Internal] Members: Cold ~32/40 bytes
     // Conceptually Sources[] is the list of font sources merged to create this font.
@@ -3619,7 +3653,8 @@ struct ImFont
     IMGUI_API ~ImFont();
     IMGUI_API ImFontGlyph*      FindGlyph(ImWchar c);
     IMGUI_API ImFontGlyph*      FindGlyphNoFallback(ImWchar c);
-    float                       GetCharAdvance(ImWchar c)       { return ((int)c < IndexAdvanceX.Size) ? IndexAdvanceX[(int)c] : FallbackAdvanceX; }
+    IMGUI_API float             GetDistanceAdjustmentForPair(ImWchar left_c, ImWchar right_c) const;
+    float                       GetCharAdvance(ImWchar c)       { return ((int)c < IndexedHotData.Size) ? IndexedHotData[(int)c].AdvanceX : FallbackHotData->AdvanceX; }
     bool                        IsLoaded() const                { return ContainerAtlas != NULL; }
     const char*                 GetDebugName() const            { return Sources ? Sources->Name : "<unknown>"; }
 
@@ -3635,9 +3670,15 @@ struct ImFont
     IMGUI_API void              BuildLookupTable();
     IMGUI_API void              ClearOutputData();
     IMGUI_API void              GrowIndex(int new_size);
-    IMGUI_API void              AddGlyph(const ImFontConfig* src_cfg, ImWchar c, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, float advance_x);
+    IMGUI_API void              AddGlyph(const ImFontConfig* src_cfg, ImWchar c, int texture_index, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, float advance_x);
     IMGUI_API void              AddRemapChar(ImWchar dst, ImWchar src, bool overwrite_dst = true); // Makes 'dst' character/glyph points to 'src' character/glyph. Currently needs to be called AFTER fonts have been built.
     IMGUI_API bool              IsGlyphRangeUnused(unsigned int c_begin, unsigned int c_last);
+    IMGUI_API void              AddKerningPair(ImWchar left_c, ImWchar right_c, float distance_adjustment);
+
+    // When this function is called...
+    // * ...right_c_info->KerningPairCount must be a known non-zero value.
+    // * ...both left_c and (supposed) right_c must not be covered in FrequentKerningPairs.
+    IMGUI_API float             GetDistanceAdjustmentForPairFromHotData(ImWchar left_c, const ImFontGlyphHotData* right_c_info) const;
 };
 
 //-----------------------------------------------------------------------------

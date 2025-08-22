@@ -794,6 +794,7 @@ IMGUI_API ImGuiStoragePair* ImLowerBound(ImGuiStoragePair* in_begin, ImGuiStorag
 // You may want to create your own instance of you try to ImDrawList completely without ImGui. In that case, watch out for future changes to this structure.
 struct IMGUI_API ImDrawListSharedData
 {
+    ImTextureID     TexIdCommon;                // Texture ID for white pixel and anti-aliased lines
     ImVec2          TexUvWhitePixel;            // UV of white pixel in the atlas
     const ImVec4*   TexUvLines;                 // UV of anti-aliased lines in the atlas
     ImFont*         Font;                       // Current/default font (optional, for simplified AddText overload)
@@ -2831,6 +2832,10 @@ struct IMGUI_API ImGuiWindow
     ImGuiDockNode*          DockNodeAsHost;                     // Which node are we owning (for parent windows)
     ImGuiID                 DockId;                             // Backup of last valid DockNode->ID, so single window remember their dock node id even when they are not bound any more
 
+    // BEGIN DALAMUD CUSTOM
+    bool                    InheritNoInputs;                    // Inherit NoInputs from parent window
+    // END DALAMUD CUSTOM
+
 public:
     ImGuiWindow(ImGuiContext* context, const char* name);
     ~ImGuiWindow();
@@ -3796,6 +3801,11 @@ namespace ImGui
     IMGUI_API void          SetNextItemRefVal(ImGuiDataType data_type, void* p_data);
     inline bool             IsItemActiveAsInputText() { ImGuiContext& g = *GImGui; return g.ActiveId != 0 && g.ActiveId == g.LastItemData.ID && g.InputTextState.ID == g.LastItemData.ID; } // This may be useful to apply workaround that a based on distinguish whenever an item is active as a text input field.
 
+    // BEGIN DALAMUD CUSTOM
+    IMGUI_API void Custom_StbTextMakeUndoReplace(ImGuiInputTextState* str, int where, int old_length, int new_length);
+    IMGUI_API void Custom_StbTextUndo(ImGuiInputTextState* str);
+    // END DALAMUD CUSTOM
+
     // Color
     IMGUI_API void          ColorTooltip(const char* text, const float* col, ImGuiColorEditFlags flags);
     IMGUI_API void          ColorEditOptionsPopup(const float* col, ImGuiColorEditFlags flags);
@@ -3895,15 +3905,15 @@ IMGUI_API const ImFontBuilderIO* ImFontAtlasGetBuilderForStbTruetype();
 IMGUI_API void      ImFontAtlasUpdateSourcesPointers(ImFontAtlas* atlas);
 IMGUI_API void      ImFontAtlasBuildInit(ImFontAtlas* atlas);
 IMGUI_API void      ImFontAtlasBuildSetupFont(ImFontAtlas* atlas, ImFont* font, ImFontConfig* src, float ascent, float descent);
-IMGUI_API void      ImFontAtlasBuildPackCustomRects(ImFontAtlas* atlas, void* stbrp_context_opaque);
+IMGUI_API void      ImFontAtlasBuildPackCustomRects(ImFontAtlas* atlas, ImVector<struct stbtt_pack_context>& pack_contexts);
 IMGUI_API void      ImFontAtlasBuildFinish(ImFontAtlas* atlas);
-IMGUI_API void      ImFontAtlasBuildRender8bppRectFromString(ImFontAtlas* atlas, int x, int y, int w, int h, const char* in_str, char in_marker_char, unsigned char in_marker_pixel_value);
-IMGUI_API void      ImFontAtlasBuildRender32bppRectFromString(ImFontAtlas* atlas, int x, int y, int w, int h, const char* in_str, char in_marker_char, unsigned int in_marker_pixel_value);
-IMGUI_API void      ImFontAtlasBuildMultiplyCalcLookupTable(unsigned char out_table[256], float in_multiply_factor);
+IMGUI_API void      ImFontAtlasBuildRender8bppRectFromString(ImFontAtlas* atlas, int texture_index, int x, int y, int w, int h, const char* in_str, char in_marker_char, unsigned char in_marker_pixel_value);
+IMGUI_API void      ImFontAtlasBuildRender32bppRectFromString(ImFontAtlas* atlas, int texture_index, int x, int y, int w, int h, const char* in_str, char in_marker_char, unsigned int in_marker_pixel_value);
+IMGUI_API void      ImFontAtlasBuildMultiplyCalcLookupTable(unsigned char out_table[256], float in_multiply_factor, float gamma_factor);
 IMGUI_API void      ImFontAtlasBuildMultiplyRectAlpha8(const unsigned char table[256], unsigned char* pixels, int x, int y, int w, int h, int stride);
 IMGUI_API void      ImFontAtlasBuildGetOversampleFactors(const ImFontConfig* src, int* out_oversample_h, int* out_oversample_v);
 
-IMGUI_API bool      ImFontAtlasGetMouseCursorTexData(ImFontAtlas* atlas, ImGuiMouseCursor cursor_type, ImVec2* out_offset, ImVec2* out_size, ImVec2 out_uv_border[2], ImVec2 out_uv_fill[2]);
+IMGUI_API bool      ImFontAtlasGetMouseCursorTexData(ImFontAtlas* atlas, ImGuiMouseCursor cursor_type, ImVec2* out_offset, ImVec2* out_size, ImVec2 out_uv_border[2], ImVec2 out_uv_fill[2], int* texture_index);
 
 //-----------------------------------------------------------------------------
 // [SECTION] Test Engine specific hooks (imgui_test_engine)
