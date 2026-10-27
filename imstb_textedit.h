@@ -802,9 +802,23 @@ static void stb_textedit_text(IMSTB_TEXTEDIT_STRING* str, STB_TexteditState* sta
       return;
 
    if (state->insert_mode && !STB_TEXT_HAS_SELECTION(state) && state->cursor < STB_TEXTEDIT_STRINGLEN(str)) {
+#ifdef DALAMUD_CUSTOM
+      // Overwrite a full UTF-8 grapheme instead of 1 byte, and clamp undo delete_length if insertion is truncated.
+      int old_len = ImMin(IMSTB_TEXTEDIT_GETNEXTCHARINDEX(str, state->cursor), STB_TEXTEDIT_STRINGLEN(str)) - state->cursor;
+      old_len = ImMax(1, old_len);
+      stb_text_makeundo_replace(str, state, state->cursor, old_len, text_len);
+      StbUndoState* undo = &state->undostate;
+      StbUndoRecord* rec = undo->undo_point > 0 ? &undo->undo_rec[undo->undo_point - 1] : NULL;
+      STB_TEXTEDIT_DELETECHARS(str, state->cursor, old_len);
+      int inserted = STB_TEXTEDIT_INSERTCHARS(str, state->cursor, text, text_len);
+      if (rec != NULL && inserted != text_len)
+         rec->delete_length = (IMSTB_TEXTEDIT_POSITIONTYPE)inserted;
+      text_len = inserted;
+#else
       stb_text_makeundo_replace(str, state, state->cursor, 1, 1);
       STB_TEXTEDIT_DELETECHARS(str, state->cursor, 1);
       text_len = STB_TEXTEDIT_INSERTCHARS(str, state->cursor, text, text_len);
+#endif // DALAMUD_CUSTOM
       if (text_len) {
          state->cursor += text_len;
          state->has_preferred_x = 0;
